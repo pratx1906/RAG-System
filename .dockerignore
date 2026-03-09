@@ -1,0 +1,31 @@
+# Secrets — never bake into image
+.env
+
+# Frontend source — not needed in the backend image
+frontend/
+
+# Python virtual environment — never copy into Docker image
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Local data — mounted as Docker volumes instead
+data/
+
+# Git & IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

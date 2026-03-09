@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Python
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data (mounted as Docker volumes)
+data/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Logs
+*.log
+test_results.txt
+
+# OS
+.DS_Store
+Thumbs.db

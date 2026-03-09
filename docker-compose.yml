@@ -1,0 +1,82 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - CHROMA_PERSIST_DIR=/app/data/chromadb
+      - UPLOAD_DIR=/app/data/uploads
+      - DATABASE_URL=sqlite:////app/data/constelli.db
+      # Set CORS_ORIGINS in .env to your Vercel/Netlify domain, e.g.:
+      # CORS_ORIGINS=https://your-app.vercel.app,https://your-app.netlify.app
+    ports:
+      - "8000:8000"
+    volumes:
+      - app_data:/app/data
+    networks:
+      - internal
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # Uncomment below if the server has an NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - internal
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Pulling gemma3:4b...' &&
+        ollama pull gemma3:4b &&
+        echo 'Pulling nomic-embed-text...' &&
+        ollama pull nomic-embed-text &&
+        echo 'All models pulled successfully.'
+      "
+    restart: "no"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  app_data:
+    driver: local
+  ollama_data:
+    driver: local
