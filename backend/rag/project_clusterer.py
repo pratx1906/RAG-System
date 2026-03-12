@@ -1,96 +1,157 @@
-import json
-import numpy as np
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import normalize
-from backend.db.chroma_client import get_documents_collection, get_projects_collection
-from backend.ingestion.embedder import embed_texts
-from backend.rag.llm_chain import generate_project_summary
-from backend.db.models import SessionLocal, ProjectCluster, UploadRecord
-from datetime import datetime
+"""
+Project lister: reads all chunks directly from ChromaDB and extracts project
+info from the stored structured text. No ML clustering, no LLM calls.
 
-def run_project_clustering():
+Extracts per-project:
+  - project name  (from "Project: ..." fields or "X is working on Y" sentences)
+  - people        (from "People Involved: ..." fields + uploader metadata)
+  - status        (from "Status: ..." fields)
+  - source files  (from chunk metadata)
+  - chunk count   (how many chunks mention this project)
+"""
+
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
+
+from backend.db.chroma_client import get_documents_collection
+
+# ── Extraction patterns ───────────────────────────────────────────────────────
+
+_RE_PROJECT = re.compile(
+    r'\bProject:\s*([^|\n\r]+?)(?:\s*\||$)', re.IGNORECASE
+)
+_RE_PEOPLE = re.compile(
+    r'\b(?:People\s+Involved|Assigned\s+To|Owner|Team|Members|People):\s*([^|\n\r]+?)(?:\s*\||$)',
+    re.IGNORECASE,
+)
+_RE_STATUS = re.compile(r'\bStatus:\s*([^,)|\n\r]+)', re.IGNORECASE)
+_RE_WORKING = re.compile(
+    r'^(.+?)\s+(?:is|are)\s+working\s+on\s+(.+?)(?:\s*[\(\.,]|$)',
+    re.MULTILINE,
+)
+
+_IGNORE_VALUES = {"none", "n/a", "-", "", "nan"}
+
+
+def _split_people(raw: str):
+    return [
+        p.strip()
+        for p in re.split(r"[,;]", raw)
+        if p.strip().lower() not in _IGNORE_VALUES
+    ]
+
+
+def _extract_fields(text: str):
+    """Return (project_name, people_list, status) extracted from one chunk."""
+    project_name = None
+    people: list = []
+    status = None
+
+    m = _RE_PROJECT.search(text)
+    if m:
+        project_name = m.group(1).strip().strip(".")
+
+    m = _RE_PEOPLE.search(text)
+    if m:
+        people = _split_people(m.group(1))
+
+    m = _RE_STATUS.search(text)
+    if m:
+        status = m.group(1).strip().strip(".")
+
+    # Fallback: "Alice is working on X"
+    if not project_name:
+        wm = _RE_WORKING.search(text)
+        if wm:
+            project_name = wm.group(2).strip().strip(".")
+            if not people:
+                people = _split_people(wm.group(1))
+
+    return project_name, people, status
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def list_all_projects():
     """
-    Main clustering pipeline:
-    1. Fetch all document embeddings from ChromaDB
-    2. DBSCAN cluster them by semantic similarity
-    3. For each cluster, use LLM to infer a project name + description
-    4. Save clusters to DB and ChromaDB projects collection
+    Scan all project_resources and personal_schedule chunks in ChromaDB
+    and return a deduplicated list of projects with people and status.
+
+    Returns list of dicts:
+      id, project_name, status, people, sources, doc_categories, chunk_count,
+      refreshed_at
     """
     collection = get_documents_collection()
-    all_data = collection.get(include=["embeddings", "metadatas", "documents"])
-
-    if not all_data["ids"]:
-        return []
-
-    # Cluster Personal Schedule + Project Resources documents.
-    # Schedules capture individual commitments; project resources add doc-level context.
-    schedule_indices = [
-        i for i, meta in enumerate(all_data["metadatas"])
-        if meta.get("doc_category") in ("personal_schedule", "project_resources")
-    ]
-    if not schedule_indices:
-        return []
-
-    embeddings = np.array([all_data["embeddings"][i] for i in schedule_indices])
-    metadatas  = [all_data["metadatas"][i]  for i in schedule_indices]
-    documents  = [all_data["documents"][i]  for i in schedule_indices]
-
-    # Normalize for cosine similarity
-    embeddings_norm = normalize(embeddings)
-
-    # DBSCAN: eps controls how tight a cluster is (lower = tighter)
-    clustering = DBSCAN(eps=0.18, min_samples=2, metric="cosine").fit(embeddings_norm)
-    labels = clustering.labels_
-
-    cluster_map = {}
-    for idx, label in enumerate(labels):
-        if label == -1:
-            continue  # noise / unclustered
-        cluster_map.setdefault(label, []).append(idx)
-
-    db = SessionLocal()
-    # Clear old clusters
-    db.query(ProjectCluster).delete()
-
-    project_clusters = []
-    for label, indices in cluster_map.items():
-        # Gather sample chunks (max 6 for LLM prompt)
-        sample_chunks = [documents[i] for i in indices[:6]]
-        sample_meta = [metadatas[i] for i in indices]
-
-        # Collect contributing users
-        contributors = list({m.get("user_email", "") for m in sample_meta if m.get("user_email")})
-        contributor_names = list({m.get("user_name", "") for m in sample_meta if m.get("user_name")})
-
-        # Ask LLM to name and describe this project
-        llm_result = generate_project_summary(sample_chunks, contributor_names)
-
-        cluster_entry = ProjectCluster(
-            name=llm_result["project_name"],
-            description=llm_result["description"],
-            keywords=json.dumps(llm_result["keywords"]),
-            member_emails=json.dumps(contributors),
+    try:
+        all_data = collection.get(
+            include=["documents", "metadatas"],
+            where={"doc_category": {"$eq": "personal_schedule"}},
         )
-        db.add(cluster_entry)
+    except Exception:
+        # Empty collection or unsupported where clause — fetch everything
+        all_data = collection.get(include=["documents", "metadatas"])
 
-        # Update upload records with inferred project
-        for i in indices:
-            filename = metadatas[i].get("filename")
-            user_email = metadatas[i].get("user_email")
-            if filename and user_email:
-                db.query(UploadRecord).filter(
-                    UploadRecord.filename == filename
-                ).update({"inferred_project": llm_result["project_name"]})
+    if not all_data or not all_data.get("ids"):
+        return []
 
-        project_clusters.append({
-            "project_name": llm_result["project_name"],
-            "description": llm_result["description"],
-            "keywords": llm_result["keywords"],
-            "contributors": contributor_names,
-            "contributor_emails": contributors,
-            "document_count": len(indices)
-        })
+    # key: lowercased project name → aggregator
+    agg_map: dict = defaultdict(lambda: {
+        "project_name": "",
+        "status": None,
+        "people": set(),
+        "sources": set(),
+        "doc_categories": set(),
+        "chunk_count": 0,
+    })
 
-    db.commit()
-    db.close()
-    return project_clusters
+    for doc, meta in zip(all_data["documents"], all_data["metadatas"]):
+        project_name, people, status = _extract_fields(doc)
+        if not project_name:
+            continue
+
+        key = project_name.lower().strip()
+        agg = agg_map[key]
+
+        if not agg["project_name"]:
+            agg["project_name"] = project_name
+
+        if status and not agg["status"]:
+            agg["status"] = status
+
+        agg["people"].update(people)
+
+        if meta:
+            if meta.get("user_name"):
+                agg["people"].add(meta["user_name"])
+            if meta.get("filename"):
+                agg["sources"].add(meta["filename"])
+            if meta.get("doc_category"):
+                agg["doc_categories"].add(meta["doc_category"])
+
+        agg["chunk_count"] += 1
+
+    refreshed_at = datetime.now(timezone.utc).isoformat()
+
+    return [
+        {
+            "id": key,
+            "project_name": agg["project_name"],
+            "status": agg["status"] or "Unknown",
+            "people": sorted(agg["people"]),
+            "sources": sorted(agg["sources"]),
+            "doc_categories": sorted(agg["doc_categories"]),
+            "chunk_count": agg["chunk_count"],
+            "refreshed_at": refreshed_at,
+        }
+        for key, agg in sorted(
+            agg_map.items(),
+            key=lambda kv: kv[1]["chunk_count"],
+            reverse=True,
+        )
+    ]
+
+
+# Keep old name as alias so any existing import still works
+def run_project_clustering():
+    return list_all_projects()

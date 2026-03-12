@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from jose import jwt
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from backend.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+from backend.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, ORG_SHARED_PASSWORD
 from backend.auth.domain_check import enforce_domain
 from backend.db.models import get_db, User
 from backend.logger import get_logger
@@ -17,6 +17,7 @@ log = get_logger("audit.auth")
 class LoginRequest(BaseModel):
     email: str
     name: str
+    org_password: str = ""
 
 def create_token(data: dict) -> str:
     to_encode = data.copy()
@@ -33,6 +34,14 @@ def login(request: Request, req: LoginRequest, db: Session = Depends(get_db)):
     except HTTPException:
         log.warning("login_rejected", extra={"event": "login_rejected", "email": req.email, "ip": ip, "reason": "domain_not_allowed"})
         raise
+
+    if not ORG_SHARED_PASSWORD:
+        log.error("org_password_not_configured", extra={"event": "org_password_not_configured", "ip": ip})
+        raise HTTPException(status_code=500, detail="Server configuration error: organization password not set.")
+
+    if req.org_password != ORG_SHARED_PASSWORD:
+        log.warning("login_rejected", extra={"event": "login_rejected", "email": req.email, "ip": ip, "reason": "invalid_org_password"})
+        raise HTTPException(status_code=401, detail="Invalid organization password.")
 
     email = req.email.strip().lower()
     user = db.query(User).filter(User.email == email).first()

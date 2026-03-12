@@ -15,6 +15,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/constelli.db")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")]
 UPLOAD_MAX_MB = int(os.getenv("UPLOAD_MAX_MB", 20))
+ORG_SHARED_PASSWORD = os.getenv("ORG_SHARED_PASSWORD", "")
 
 _WEAK_KEYS = {"", "supersecret", "change_this_to_a_long_random_string_in_production"}
 if not SECRET_KEY or SECRET_KEY in _WEAK_KEYS or "change_this" in SECRET_KEY or len(SECRET_KEY) < 32:
